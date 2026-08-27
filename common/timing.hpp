@@ -11,7 +11,7 @@ struct Stats { double median_ms, min_ms, max_ms, stddev_ms; };
 inline Stats time_kernel(const std::function<void()>& launch,
     int warmup = 20, int iters = 200, int reps = 5) 
 {
-    for (int i = 0; i < warmup: ++i) lanch();
+    for (int i = 0; i < warmup; ++i) launch();
     HIP_CHECK(hipDeviceSynchronize());
 
     std::vector<double> per_rep;
