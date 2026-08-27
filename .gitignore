@@ -5,6 +5,8 @@
 #   Official AMD ROCm HIP .gitignore: https://github.com/ROCm/hip/blob/amd-staging/.gitignore
 
 # 1. Build directories and files
+.vscode/ipch/
+out*/
 /build/                          # common build directory
 /CMakeFiles/                     # CMake internal files
 /CMakeCache.txt                  # CMake cache file
@@ -26,6 +28,8 @@ meson-logs/                      # Meson log directory
 *.ii.cpp                         # C++ preprocessed output
 *.out                            # generic executable outputs
 *.exe                            # Windows executables
+*.db
+*.csv.tmp
 
 # 3. HIP/ROCm specific binaries and intermediates
 *.hsaco                          # ROCm compiled binary
