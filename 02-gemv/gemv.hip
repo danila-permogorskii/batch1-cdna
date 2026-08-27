@@ -67,15 +67,39 @@ void gemv_dot2(const half2_t* __restrict__ W, // [N][K/2], row-major
     const int row0 = blockIdx.x * waves + wave;
     const int stride = gridDim.x * waves;
 
+    // for (int row = row0; row < N; row += stride) {
+    //     const half2_t* wrow = W + size_t(row) * K2;
+    //     float acc = 0.f;
+
+    //     // Every lane takes its own part of half2
+    //     for (int i = lane; i < K2; i += 64) {
+    //         acc = dot2(wrow[i], x[i], acc);
+    //     }
+
+    //     float s = wave_reduce_dpp(acc);
+
+    //     if (lane == 63) y[row] = s;
+    // }
+
     for (int row = row0; row < N; row += stride) {
         const half2_t* wrow = W + size_t(row) * K2;
-        float acc = 0.f;
 
-        // Every lane takes its own part of half2
-        for (int i = lane; i < K2; i += 64) {
-            acc = dot2(wrow[i], x[i], acc);
+        // four independent accumulators
+        float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+
+        int i = lane;
+        for (; i + 3 * 64 < K2; i += 4*64) {
+            half2_t w0 = wrow[i], x0 = x[i];
+            half2_t w1 = wrow[i + 64], x1 = x[i + 64];
+            half2_t w2 = wrow[i + 128], x2 = x[i + 128];
+            half2_t w3 = wrow[i + 192], x3 = x[i + 192];
+            acc0 = dot2(w0, x0, acc0);
+            acc1 = dot2(w1, x1, acc1);
+            acc2 = dot2(w2, x2, acc2);
+            acc3 = dot2(w3, x3, acc3);
         }
 
+        float acc = (acc0 + acc1) + (acc2 + acc3);
         float s = wave_reduce_dpp(acc);
 
         if (lane == 63) y[row] = s;
@@ -112,8 +136,8 @@ int main(int argc, char** argv) {
             K = std::atoi(argv[++i]);
     }
 
-    if (K % 128 != 0) {
-        std::fprintf(stderr, "K must be a multiple of 128\n");
+    if (K % 512 != 0) {
+        std::fprintf(stderr, "K must be a multiple of 512\n");
         return 1;
     }
 
@@ -154,13 +178,13 @@ int main(int argc, char** argv) {
 
     // run
     const dim3 block(64, 8); // one x, another as in Kog
-    const dim3 grid(256);
+    int gblocks = 256;
     auto launch_at = [&](int copy) {
         const half2_t* Wp = (const half2_t*)((const char*)d_W + size_t(copy) * w_bytes);
         if (mode == "dot2")
-            hipLaunchKernelGGL(gemv_dot2, grid, block, 0, 0, Wp, d_x, d_y, N, K2);
+            hipLaunchKernelGGL(gemv_dot2, dim3(gblocks), block, 0, 0, Wp, d_x, d_y, N, K2);
         else
-            hipLaunchKernelGGL(gemv_mfma, grid, block, 0, 0, Wp, d_x, d_y, N, K2);
+            hipLaunchKernelGGL(gemv_mfma, dim3(gblocks), block, 0, 0, Wp, d_x, d_y, N, K2);
     };
 
     launch_at(0);
@@ -194,23 +218,26 @@ int main(int argc, char** argv) {
     }
 
     // bench
-    int c = 0;
-    auto launch = [&]{ launch_at(c); c = (c + 1) % copies; };
-    Stats st = time_kernel(launch, /* warmup */20, /* iters */100, /* reps */5);
-
     const double bytes_w = double(N) * K * sizeof(_Float16);
     const double bytes_x = double(K) * sizeof(_Float16);
     const double bytes_y = double(N) * sizeof(float);
-    const double total = bytes_w + bytes_x + bytes_y;
-    const double gbs = total / (st.median_ms * 1e-3) / 1e9;
-    const double ceiling = 4822.0; // from 01-ceiling
+    const double total   = bytes_w + bytes_x + bytes_y;
+    const double ceiling = 4822.0;           // из 01-ceiling
 
-        std::printf("\n%-6s  %8.1f us  %8.1f GB/s  MBU %5.1f%%  (sd %.4f ms)\n",
-                mode.c_str(), st.median_ms * 1e3, gbs, 100.0 * gbs / ceiling,
-                st.stddev_ms);
-    std::printf("bytes: weights %.1f MB (%.2f%%), x %.1f kB, y %.1f kB\n",
+    std::printf("bytes: weights %.1f MB (%.2f%%), x %.1f kB, y %.1f kB\n\n",
                 bytes_w / 1e6, 100.0 * bytes_w / total,
                 bytes_x / 1e3, bytes_y / 1e3);
+
+    for (int g : {256, 512, 1024, 2048}) {
+        gblocks = g;
+        int c = 0;
+        auto launch = [&]{ launch_at(c); c = (c + 1) % copies; };
+        Stats st = time_kernel(launch, /*warmup=*/20, /*iters=*/100, /*reps=*/5);
+        const double gbs = total / (st.median_ms * 1e-3) / 1e9;
+        std::printf("%-6s blocks=%5d  %8.1f us  %8.1f GB/s  MBU %5.1f%%  (sd %.4f ms)\n",
+                    mode.c_str(), g, st.median_ms * 1e3, gbs,
+                    100.0 * gbs / ceiling, st.stddev_ms);
+    }
 
     HIP_CHECK(hipFree(d_W));
     HIP_CHECK(hipFree(d_x));
