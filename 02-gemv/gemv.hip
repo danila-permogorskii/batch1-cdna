@@ -13,11 +13,15 @@
 typedef _Float16 half2_t __attribute__((ext_vector_type(2)));
 typedef _Float16 half4_t __attribute__((ext_vector_type(4)));
 typedef float    float4_t __attribute__((ext_vector_type(4)));
+typedef float f32x4 __attribute__((ext_vector_type(4)));
 
 __device__ __forceinline__ float dot2(half2_t a, half2_t b, float c) {
     return __builtin_amdgcn_fdot2(a, b, c, false);
 }
 
+__device__ __forceinline__ half2_t as_h2(float v) {
+    return __builtin_bit_cast(half2_t, v);
+}
 
 __device__ __forceinline__ float4_t mfma_16x16x16(half4_t a, half4_t b, float4_t c) {
     return __builtin_amdgcn_mfma_f32_16x16x16f16(a, b, c, 0, 0, 0);
@@ -67,28 +71,13 @@ void gemv_dot2(const half2_t* __restrict__ W, // [N][K/2], row-major
     const int row0 = blockIdx.x * waves + wave;
     const int stride = gridDim.x * waves;
 
-    // for (int row = row0; row < N; row += stride) {
-    //     const half2_t* wrow = W + size_t(row) * K2;
-    //     float acc = 0.f;
-
-    //     // Every lane takes its own part of half2
-    //     for (int i = lane; i < K2; i += 64) {
-    //         acc = dot2(wrow[i], x[i], acc);
-    //     }
-
-    //     float s = wave_reduce_dpp(acc);
-
-    //     if (lane == 63) y[row] = s;
-    // }
-
     for (int row = row0; row < N; row += stride) {
         const half2_t* wrow = W + size_t(row) * K2;
 
         // four independent accumulators
         float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
 
-        int i = lane;
-        for (; i + 3 * 64 < K2; i += 4*64) {
+        for (int i = lane; i < K2; i += 256) {
             half2_t w0 = wrow[i], x0 = x[i];
             half2_t w1 = wrow[i + 64], x1 = x[i + 64];
             half2_t w2 = wrow[i + 128], x2 = x[i + 128];
@@ -120,7 +109,100 @@ static void gemv_ref(const std::vector<_Float16>& W,
     }
 }
 
-__global__ void gemv_mfma(const half2_t*, const half2_t*, float*, int, int) {}
+
+__global__ __launch_bounds__(512)
+void gemv_mfma(const half2_t* __restrict__ W,
+               const half2_t* __restrict__ x,
+               float* __restrict__ y,
+               int N, int K2)
+{
+    const int lane   = threadIdx.x;
+    const int wave   = threadIdx.y;
+    const int waves  = blockDim.y;
+    const int row0   = (blockIdx.x * waves + wave) * 16;   // 16 rows per wave
+    const int stride = gridDim.x * waves * 16;
+
+    for (int rb = row0; rb < N; rb += stride) {
+        float4_t c = {0.f, 0.f, 0.f, 0.f};
+
+        for (int k = 0; k < K2; k += 8) {          // 8 half2 = 16 values along K
+            // A tile: row 0 is the activation, rows 1..15 are zeros.
+            const int a_row = lane / 16;
+            half4_t a = {0, 0, 0, 0};
+            if (a_row == 0) {
+                const int kk = k + (lane % 16) / 2 * 2;
+                half2_t p0 = x[kk], p1 = x[kk + 1];
+                a[0] = p0[0]; a[1] = p0[1]; a[2] = p1[0]; a[3] = p1[1];
+            }
+
+            // B tile: 16x16 block of weights.
+            const int b_row = rb + lane % 16;
+            const int bk    = k + (lane / 16) * 2;
+            half2_t q0 = W[size_t(b_row) * K2 + bk];
+            half2_t q1 = W[size_t(b_row) * K2 + bk + 1];
+            half4_t b = {q0[0], q0[1], q1[0], q1[1]};
+
+            c = mfma_16x16x16(a, b, c);
+        }
+
+        // Only row 0 of the C tile is useful.
+        if (lane < 16 && rb + lane < N) y[rb + lane] = c[0];
+    }
+}
+
+__global__ __launch_bounds__(512)
+void gemv_dot2_wide(const half2_t* __restrict__ W,
+                    const half2_t* __restrict__ x,
+                    float* __restrict__ y,
+                    int N, int K2)
+{
+    const int lane = threadIdx.x;
+    const int wave = threadIdx.y;
+    const int waves = blockDim.y;
+    const int row0 = blockIdx.x * waves + wave;
+    const int stride = gridDim.x * waves;
+    const int K4 = K2 / 4; // elements amount in f32x4 string
+
+    const f32x4* x4 = (const f32x4*)x;
+
+    for (int row = row0; row < N; row += stride) {
+        const f32x4* w4 = (const f32x4*)(W + size_t(row) * K2);
+
+        float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+
+        for (int j = lane; j < K4; j += 256) {
+            f32x4 w0 = w4[j],       a0 = x4[j];
+            f32x4 w1 = w4[j + 64],  a1 = x4[j + 64];
+            f32x4 w2 = w4[j + 128], a2 = x4[j + 128];
+            f32x4 w3 = w4[j + 192], a3 = x4[j + 192];
+
+            acc0 = dot2(as_h2(w0.x), as_h2(a0.x), acc0);
+            acc0 = dot2(as_h2(w0.y), as_h2(a0.y), acc0);
+            acc0 = dot2(as_h2(w0.z), as_h2(a0.z), acc0);
+            acc0 = dot2(as_h2(w0.w), as_h2(a0.w), acc0);
+
+            acc1 = dot2(as_h2(w1.x), as_h2(a1.x), acc1);
+            acc1 = dot2(as_h2(w1.y), as_h2(a1.y), acc1);
+            acc1 = dot2(as_h2(w1.z), as_h2(a1.z), acc1);
+            acc1 = dot2(as_h2(w1.w), as_h2(a1.w), acc1);
+
+            acc2 = dot2(as_h2(w2.x), as_h2(a2.x), acc2);
+            acc2 = dot2(as_h2(w2.y), as_h2(a2.y), acc2);
+            acc2 = dot2(as_h2(w2.z), as_h2(a2.z), acc2);
+            acc2 = dot2(as_h2(w2.w), as_h2(a2.w), acc2);
+
+            acc3 = dot2(as_h2(w3.x), as_h2(a3.x), acc3);
+            acc3 = dot2(as_h2(w3.y), as_h2(a3.y), acc3);
+            acc3 = dot2(as_h2(w3.z), as_h2(a3.z), acc3);
+            acc3 = dot2(as_h2(w3.w), as_h2(a3.w), acc3);
+        }
+
+        float acc = (acc0 + acc1) + (acc2 + acc3);
+        float s = wave_reduce_dpp(acc);
+
+        if (lane == 63) y[row] = s;
+    }
+}
 
 int main(int argc, char** argv) {
     print_device();
@@ -136,8 +218,9 @@ int main(int argc, char** argv) {
             K = std::atoi(argv[++i]);
     }
 
-    if (K % 512 != 0) {
-        std::fprintf(stderr, "K must be a multiple of 512\n");
+
+    if (K % 2048 != 0) {
+        std::fprintf(stderr, "K must be a multiple of 2048\n");
         return 1;
     }
 
@@ -183,6 +266,8 @@ int main(int argc, char** argv) {
         const half2_t* Wp = (const half2_t*)((const char*)d_W + size_t(copy) * w_bytes);
         if (mode == "dot2")
             hipLaunchKernelGGL(gemv_dot2, dim3(gblocks), block, 0, 0, Wp, d_x, d_y, N, K2);
+        else if (mode == "wide")
+            hipLaunchKernelGGL(gemv_dot2_wide, dim3(gblocks), block, 0, 0, Wp, d_x, d_y, N, K2);
         else
             hipLaunchKernelGGL(gemv_mfma, dim3(gblocks), block, 0, 0, Wp, d_x, d_y, N, K2);
     };

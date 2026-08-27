@@ -46,6 +46,72 @@ that installation work is pure overhead. The 10% is what it costs.
 
 Full method, raw output and analysis: [`results/01-ceiling.md`](results/01-ceiling.md).
 
+### Batch-1 GEMV
+
+Hand-written FP16 `y = Wx`, batch size one, N = K = 4096. Weights are rotated across 32
+copies so the working set is 1.07 GB — four times the last-level cache. Bytes counted as
+2·N·K for weights plus 2·K in and 2·N out; the weights are 99.93% of the total. MBU is
+against the 4822 GB/s measured above.
+
+Each wavefront computes one output element as a dot product between the activation
+vector and one row of W. Lanes stride by 64 across the row so a wavefront issues one
+contiguous transaction; partial products accumulate in FP32 via `v_dot2_f32_f16` and
+reduce across lanes with a DPP `row_shr`/`row_bcast` chain.
+
+| version | best grid | µs | GB/s | MBU | what changed |
+|---|---|---|---|---|---|
+| one accumulator | 256 | 29.3 | 1146 | 23.8% | baseline |
+| four accumulators | 1024 | 11.6 | 2897 | 60.1% | loads issued as a batch |
+| wide loads | 256 | 9.5 | 3523 | **73.1%** | 16 B per lane instead of 4 |
+
+**The first jump is the compiler, not the algorithm.** With a single accumulator the
+compiler emits `s_waitcnt vmcnt(0)` inside the loop body: the wavefront issues two loads,
+waits for both, computes one `dot2`, and repeats. Nothing hides HBM latency. Four
+independent accumulators let it issue all eight loads first and then wait partially —
+`vmcnt(3)`, `vmcnt(2)`, `vmcnt(1)`, `vmcnt(0)` — consuming each pair as it lands.
+Offsets fold into the instruction encoding, so address arithmetic drops from eight
+updates per iteration to one.
+
+```
+; one accumulator — full barrier every iteration
+global_load_dword v12, v[8:9], off
+global_load_dword v13, v[6:7], off
+...
+s_waitcnt vmcnt(0)
+v_dot2c_f32_f16_e32 v11, v12, v13
+
+; four accumulators — batched loads, partial waits
+global_load_dword v15, v[6:7], off
+global_load_dword v16, v[6:7], off offset:256
+global_load_dword v17, v[6:7], off offset:512
+global_load_dword v18, v[6:7], off offset:768
+global_load_dword v19, v[8:9], off offset:-512
+global_load_dword v20, v[8:9], off offset:-256
+global_load_dword v21, v[8:9], off
+global_load_dword v22, v[8:9], off offset:256
+...
+s_waitcnt vmcnt(3)
+v_dot2c_f32_f16_e32 v3, v15, v19
+s_waitcnt vmcnt(2)
+v_dot2c_f32_f16_e32 v11, v16, v20
+s_waitcnt vmcnt(1)
+v_dot2c_f32_f16_e32 v12, v17, v21
+s_waitcnt vmcnt(0)
+v_dot2c_f32_f16_e32 v13, v18, v22
+```
+
+**The second jump is transaction width.** Reading `f32x4` — sixteen bytes, four packed
+`half2` values — and unpacking in registers turns eight `global_load_dword` into eight
+`global_load_dwordx4`.
+
+**The optimal grid moves left as the kernel gets wider.** The narrow version plateaus at
+1024 blocks; the wide one peaks at 256 and drops to 68–69% beyond it. The wide kernel
+does four times the work per wavefront over a loop four times shorter — two iterations
+per row — so additional parallelism stops paying once there is little work left per unit
+of it. Grid size is a function of work per wavefront, not just of CU count.
+
+Full method, raw output and analysis: [`results/02-gemv.md`](results/02-gemv.md).
+
 <!-- ANCHOR:RESULTS -->
 
 ## Hardware and software
@@ -95,10 +161,28 @@ modifier in the non-temporal variant. `__builtin_nontemporal_load` requires a na
 `ext_vector_type`; HIP's `float4` is a C++ wrapper class and is rejected by the
 builtin, so the kernel uses a compiler vector type throughout.
 
+### `02-gemv` — batch-1 GEMV and MBU
+
+Three versions of the same kernel, measured against the ceiling from `01-ceiling`: a
+naive accumulation loop, the same loop with four independent accumulators, and a version
+reading sixteen bytes per lane instead of four. Correctness is checked against a CPU
+reference accumulating in double precision before any timing is taken; the program exits
+rather than measure a wrong kernel.
+
+The point of the experiment is not the final number but the three mechanisms behind it,
+each visible in the generated assembly: a compiler-inserted wait inside the loop body,
+insufficient loads in flight, and transaction width.
+
+Timings and hardware counters come from separate runs — under `rocprofv3 --pmc` the same
+kernel measures 56 µs instead of 9.5, since counter collection serialises dispatches.
+
 <!-- ANCHOR:EXPERIMENTS -->
 
 ## What this is not
 
+- No MFMA comparison yet. A matrix-core version of the batch-1 GEMV did not validate
+  against the CPU reference; the tile layout needs checking in isolation against
+  §7.1.4.2 first. See the "Next" section of `results/02-gemv.md`.
 - Not a comparison of inference engines. These are instruction- and
   synchronisation-level microbenchmarks.
 - Not tuned kernels. Where a hand-written kernel loses to a vendor library, the
