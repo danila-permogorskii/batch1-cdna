@@ -112,6 +112,56 @@ of it. Grid size is a function of work per wavefront, not just of CU count.
 
 Full method, raw output and analysis: [`results/02-gemv.md`](results/02-gemv.md).
 
+### Instruction-level forwarding cost
+
+§7.5, Table 37 of the CDNA3 ISA states that a chain of dot-product instructions
+accumulating into the same SrcC register has zero wait states, but that any other opcode
+touching those registers disables the forwarding path and costs three. The behaviour is
+documented; as far as I can find, it has not been measured publicly.
+
+Single block, 100 000 iterations, timed with `s_memrealtime` — calibrated at 99.87 MHz
+against a known interval rather than assumed. Minimum of five runs, since this is a
+latency floor and noise can only add to it. Cycles are ns/instruction × the 2100 MHz
+shader clock.
+
+| chain | cycles/instruction | cycles/iteration | ISA prediction |
+|---|---|---|---|
+| pure `v_dot2`, shared SrcC | 7.03 | 7.03 | ~1 |
+| two independent `v_dot2` chains | 6.14 | 12.28 | ~1 |
+| `v_dot2` interleaved with `v_mul_f32` | 11.16 | 22.32 | ~4 |
+
+**SrcC forwarding works, and the ISA is right about it.** A dependent chain costs 7.03
+cycles per instruction against a 6.14 throughput floor measured with two independent
+chains — the dependency costs 0.9 cycles, not three, and there is no `s_nop` anywhere in
+the pure chain's assembly. That is what zero wait states looks like measured.
+
+**Breaking the forwarding path costs five times what the table documents.** Adding one
+`v_mul_f32` takes an iteration from 7.03 to 22.32 cycles. `s_nop 2` accounts for three of
+those fifteen; the rest is the multiply's own issue cost plus the next `dot2` having to
+read the accumulator from the register file instead of receiving it forwarded.
+
+```
+; pure — sixteen dot2 back to back, no stalls
+v_dot2c_f32_f16_e32 v1, 0x3bff3c01, v2
+v_dot2c_f32_f16_e32 v1, 0x3bff3c01, v2
+v_dot2c_f32_f16_e32 v1, 0x3bff3c01, v2
+
+; mixed — three cycles of stall before every multiply
+v_dot2c_f32_f16_e32 v1, 0x3bff3c01, v2
+s_nop 2
+v_mul_f32_e32 v1, 0x3f800001, v1
+```
+
+**Table 37 specifies a NOP requirement, not a performance cost.** An accumulation loop
+has to stay pure — not because of three cycles, but because of fifteen.
+
+Timings are invariant to within 1% across 1, 8 and 16 wavefronts per block. At sixteen
+there are four per SIMD, each finishing in the same wall time as a lone wavefront, so the
+6.14-cycle floor is a per-wavefront issue limit rather than a SIMD-wide one.
+
+Full method, raw output and analysis: [`results/03-dlops.md`](results/03-dlops.md).
+
+
 <!-- ANCHOR:RESULTS -->
 
 ## Hardware and software
@@ -175,6 +225,15 @@ insufficient loads in flight, and transaction width.
 
 Timings and hardware counters come from separate runs — under `rocprofv3 --pmc` the same
 kernel measures 56 µs instead of 9.5, since counter collection serialises dispatches.
+
+### `03-dlops` — DL-ops forwarding cost
+
+Three instruction chains doing identical arithmetic with different interleaving, timed
+on the device's constant-rate clock inside a single wavefront. The hardware provides a
+dedicated forwarding path between two identical dot-product instructions through the
+accumulator operand and removes it the moment any other opcode touches those registers.
+This measures both halves: what the forwarding is worth, and what losing it costs.
+
 
 <!-- ANCHOR:EXPERIMENTS -->
 
