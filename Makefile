@@ -17,7 +17,7 @@ $(BINS): %: %.hip
 	$(HIPCXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
 
 $(ASM): %.s: %.hip
-	$(HIPCXX) $(CXXFLAGS) --offload-device-only -S -o $@ $
+	$(HIPCXX) $(CXXFLAGS) --offload-device-only -S -o $@ $<
 
 clean:
 	rm -f $(BINS) $(ASM)
