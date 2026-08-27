@@ -38,5 +38,29 @@ int main(int argc, char** argv) {
     HIP_CHECK(hipMemset(d_sink, 0, sizeof(float)));
 
     std::printf("buffer: %.2f GB (LLC is 0.25 GB)\n", bytes / 1e9);
+
+    const int threads = 512;
+    const int blocks = 256;
+    HIP_CHECK(hipMemset(d_sink, 0, sizeof(float)));
+    hipLaunchKernelGGL((stream_read<false>), dim3(blocks), dim3(threads), 0, 0, d_src, n4, d_sink);
+    HIP_CHECK(hipGetLastError());
+    HIP_CHECK(hipDeviceSynchronize());
+    std::printf("kernel ran\n");
+
+    auto run = [&](int blocks, bool nt) {
+        auto launch = [&]{
+            if(nt) hipLaunchKernelGGL((stream_read<true>), dim3(blocks), dim3(threads), 0, 0, d_src, n4, d_sink);
+            else hipLaunchKernelGGL((stream_read<false>), dim3(blocks), dim3(threads), 0, 0, d_src, n4, d_sink);
+        };
+        Stats st = time_kernel(launch, /* warmup */10, /* iters */20, /* reps */5);
+        double gbs = bytes / (st.median_ms * 1e-3) / 1e9;
+        std::printf("blocks=%4d nt=%d %8.3f ms %8.1f GB/s (sd %.3f ms)\n",
+            blocks, int(nt), st.median_ms, gbs, st.stddev_ms);
+        return gbs;
+    };
+
+    for (int b : {64, 128, 256, 512, 1024}) { run(b, false); }
+    std::printf("\n");
+    for (int b : {256, 512, 1024}) { run(b, true); }
     return 0;
 }
